@@ -1,0 +1,15 @@
+# ============================================================
+# 90-local.conf.example —— 本机私有 tmux 配置模板
+#   install.sh 会复制成 90-local.conf（已被 .gitignore 忽略）
+#   这里放：机器相关路径、代理、特定主机才装的工具绑定等
+# ============================================================
+
+# 例：只在某些机器上启用窗口编号从 1 开始
+# set -g base-index 1
+# setw -g pane-base-index 1
+
+# 例：给某个项目加一条一键起环境的模板绑定
+# bind P run-shell 'tmux-layout load work'
+
+# 例：本机 tmux 布局模板存放目录（默认 XDG data 目录）
+# setenv -g TMUX_LAYOUT_DIR "$HOME/.local/share/tmux/layouts"

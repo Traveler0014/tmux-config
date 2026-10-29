@@ -1,0 +1,9 @@
+# 本机私有配置，不入库
+.config/tmux/90-local.conf
+
+# 布局保存的临时文件
+*.tmp.*
+
+# 编辑器 / 系统噪音
+.DS_Store
+*.swp

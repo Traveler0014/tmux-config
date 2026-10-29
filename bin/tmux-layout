@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# ============================================================
+# tmux-layout —— 零依赖的 tmux session 布局保存 / 恢复
+#
+#   tmux-layout save <模板名> [session]        保存当前(或指定) session
+#   tmux-layout load <模板名> [-n 新名] [-d] [--with-programs]
+#   tmux-layout list                           列出模板
+#   tmux-layout show <模板名>                  查看模板原文
+#   tmux-layout rm <模板名>                    删除模板
+#   tmux-layout menu                           在 tmux 内弹出模板菜单
+#
+# 记录内容：窗口划分 + 每个 pane 的几何位置 + 每个 pane 的当前目录
+#          （+ 当前跑着的命令名，仅在 --with-programs 时回放）
+#
+# 实现要点：
+#   1. tmux 的 window_layout 串里的校验和只覆盖「结构」不含尺寸，
+#      所以原样保存、在任意大小的窗口里 select-layout 都能贴回去。
+#   2. 布局串里没有可靠的 pane 身份信息，恢复时用 (top,left) 排序做
+#      位置序配对，把每个 pane respawn 回它原来的目录。
+# ============================================================
+set -euo pipefail
+
+FORMAT_VERSION=1
+STATE_DIR="${TMUX_LAYOUT_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/tmux/layouts}"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TEMPLATE_DIR="${TMUX_LAYOUT_TEMPLATES:-$SELF_DIR/../layouts}"
+
+die()  { printf 'tmux-layout: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*" >&2; }
+t()    { command tmux "$@"; }
+
+sanitize() { printf '%s' "${1:-}" | tr '|\n' '//'; }
+
+is_shell() {
+  case "${1:-}" in
+    ''|bash|zsh|sh|dash|ksh|fish|nu|elvish|xonsh|pwsh|powershell|tmux) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_template() {
+  local name=$1 f
+  for f in "$STATE_DIR/$name.conf" "$TEMPLATE_DIR/$name.conf"; do
+    [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- save
+cmd_save() {
+  local name="${1:-}" session="${2:-}"
+  [ -n "$name" ] || die "用法: tmux-layout save <模板名> [session]"
+  case $name in
+    *[!A-Za-z0-9._-]*) die "模板名只能包含字母、数字、. _ -" ;;
+  esac
+  if [ -z "$session" ]; then
+    session=$(t display-message -p '#{session_name}' 2>/dev/null) \
+      || die "不在 tmux 内，且未指定 session"
+  fi
+  t has-session -t "=$session" 2>/dev/null || die "session 不存在: $session"
+
+  mkdir -p "$STATE_DIR"
+  local out tmp
+  out="$STATE_DIR/$name.conf"
+  tmp="$out.tmp.$$"
+
+  {
+    printf '# tmux-layout v%s  session=%s  saved=%s\n' \
+      "$FORMAT_VERSION" "$session" "$(date -Is)"
+    printf 'meta|%s|%s\n' "$FORMAT_VERSION" "$session"
+    while IFS='|' read -r widx wname wactive wlayout; do
+      printf 'window|%s|%s|%s|%s\n' \
+        "$widx" "$(sanitize "$wname")" "$wactive" "$wlayout"
+      t list-panes -t "=$session:$widx" -F \
+        'pane|#{window_index}|#{pane_index}|#{pane_top}|#{pane_left}|#{pane_width}x#{pane_height}|#{pane_active}|#{pane_current_command}|#{pane_current_path}'
+    done < <(t list-windows -t "=$session" -F \
+              '#{window_index}|#{window_name}|#{window_active}|#{window_layout}' \
+              | sort -t'|' -k1,1n)
+  } >"$tmp"
+
+  mv -f "$tmp" "$out"
+  chmod 644 "$out"
+  info "已保存: $out"
+}
+
+# ---------------------------------------------------------------- load
+cmd_load() {
+  local name="" newname="" detach=0 programs=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -n) [ $# -ge 2 ] || die "-n 需要一个参数"; newname=$2; shift 2 ;;
+      -d) detach=1; shift ;;
+      --with-programs) programs=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "未知选项: $1" ;;
+      *) name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "用法: tmux-layout load <模板名> [-n 新名] [-d] [--with-programs]"
+
+  local file
+  file=$(resolve_template "$name") || die "找不到模板: $name"
+
+  local session
+  session=$(awk -F'|' '$1=="meta"{print $3; exit}' "$file")
+  [ -n "$session" ] || die "模板缺少 meta 头: $file"
+  [ -n "$newname" ] && session=$newname
+
+  if t has-session -t "=$session" 2>/dev/null; then
+    die "session 已存在: $session（用 -n 指定新名字，或先 kill）"
+  fi
+
+  local -a win_lines=()
+  mapfile -t win_lines < <(grep '^window|' "$file" | sort -t'|' -k2,2n)
+  [ ${#win_lines[@]} -gt 0 ] || die "模板里没有 window 记录: $file"
+
+  local created=0 w widx wname wactive wlayout
+  for w in "${win_lines[@]}"; do
+    IFS='|' read -r _ widx wname wactive wlayout <<<"$w"
+
+    local -a panes=()
+    mapfile -t panes < <(awk -F'|' -v w="$widx" '$1=="pane" && $2==w' "$file" \
+                          | sort -t'|' -k4,4n -k5,5n)
+    local n=${#panes[@]}
+    [ "$n" -ge 1 ] || die "window $widx 没有 pane 记录"
+
+    local first_cwd
+    first_cwd=$(cut -d'|' -f9 <<<"${panes[0]}")
+
+    if [ "$created" -eq 0 ]; then
+      t new-session -d -s "$session" -n "$wname" -c "$first_cwd"
+      created=1
+      local cur
+      cur=$(t display-message -p -t "=$session:" '#{window_index}')
+      [ "$cur" = "$widx" ] || t move-window -s "=$session:$cur" -t "=$session:$widx"
+    else
+      t new-window -d -t "=$session:$widx" -n "$wname" -c "$first_cwd"
+    fi
+
+    # 补齐 pane 数量（几何稍后由 select-layout 统一贴回）
+    local k
+    for ((k = 1; k < n; k++)); do
+      t split-window -d -t "=$session:$widx" -c "$first_cwd" >/dev/null
+    done
+
+    # 回放布局结构
+    if ! t select-layout -t "=$session:$widx" "$wlayout" 2>/dev/null; then
+      info "警告: window $widx 布局回放失败，保留默认布局"
+    fi
+
+    # 用 (top,left) 排序做位置序配对，把每个 pane 还原到原目录
+    local -a rpanes=()
+    mapfile -t rpanes < <(t list-panes -t "=$session:$widx" -F \
+                            '#{pane_top}|#{pane_left}|#{pane_index}' \
+                            | sort -t'|' -k1,1n -k2,2n)
+
+    local active_target=""
+    for ((k = 0; k < n; k++)); do
+      local pactive pcmd pcwd rpidx
+      IFS='|' read -r _ _ _ _ _ _ pactive pcmd pcwd <<<"${panes[$k]}"
+      rpidx=$(cut -d'|' -f3 <<<"${rpanes[$k]:-}")
+      [ -n "$rpidx" ] || continue
+
+      t respawn-pane -k -t "=$session:$widx.$rpidx" -c "$pcwd"
+      if [ "$programs" -eq 1 ] && ! is_shell "$pcmd"; then
+        t send-keys -t "=$session:$widx.$rpidx" "$pcmd" C-m
+      fi
+      [ "$pactive" = "1" ] && active_target="$widx.$rpidx"
+    done
+    [ -n "$active_target" ] && t select-pane -t "=$session:$active_target"
+  done
+
+  # 恢复激活的窗口
+  local active_win
+  active_win=$(awk -F'|' '$1=="window" && $4=="1"{print $2; exit}' "$file")
+  [ -n "$active_win" ] && t select-window -t "=$session:$active_win" 2>/dev/null || true
+
+  info "已恢复 session: $session"
+
+  [ "$detach" -eq 1 ] && return 0
+  if [ -n "${TMUX:-}" ]; then
+    t switch-client -t "=$session"
+  else
+    exec command tmux attach-session -t "=$session"
+  fi
+}
+
+# ---------------------------------------------------------------- 其它
+all_templates() {
+  mkdir -p "$STATE_DIR"
+  { ls -1 "$STATE_DIR"/*.conf 2>/dev/null || true
+    ls -1 "$TEMPLATE_DIR"/*.conf 2>/dev/null || true
+  } | sort -u
+}
+
+cmd_list() {
+  local f n total=0
+  printf '%-24s %-8s %s\n' TEMPLATE WINDOWS FILE
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    n=$(basename "$f" .conf)
+    printf '%-24s %-8s %s\n' "$n" "$(grep -c '^window|' "$f")" "$f"
+    total=$((total + 1))
+  done < <(all_templates)
+  [ "$total" -gt 0 ] || info "还没有任何模板（先 tmux-layout save <名>）"
+}
+
+cmd_show() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "用法: tmux-layout show <模板名>"
+  local file
+  file=$(resolve_template "$name") || die "找不到模板: $name"
+  cat "$file"
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "用法: tmux-layout rm <模板名>"
+  local f="$STATE_DIR/$name.conf"
+  [ -f "$f" ] || die "找不到模板: $f（仓库模板 layouts/ 里的请直接删文件）"
+  rm -f "$f"
+  info "已删除: $f"
+}
+
+cmd_menu() {
+  local -a items=()
+  local f n
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    n=$(basename "$f" .conf)
+    items+=("$n" "" "run-shell 'tmux-layout load $n'")
+  done < <(all_templates)
+  [ ${#items[@]} -gt 0 ] || { t display-message '没有已保存的布局模板'; return 0; }
+  t display-menu -T " 载入布局 " -x C -y C "${items[@]}"
+}
+
+usage() {
+  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case $cmd in
+  save)  cmd_save "$@" ;;
+  load)  cmd_load "$@" ;;
+  list|ls) cmd_list "$@" ;;
+  show)  cmd_show "$@" ;;
+  rm|delete) cmd_rm "$@" ;;
+  menu)  cmd_menu "$@" ;;
+  ''|-h|--help|help) usage ;;
+  *) usage; die "未知子命令: $cmd" ;;
+esac
