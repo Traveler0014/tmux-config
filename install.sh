@@ -36,10 +36,14 @@ elif [ -e "$HOME/.tmux.conf" ]; then
   backup_if_real "$HOME/.tmux.conf"
 fi
 
-# 3) 布局脚本
-chmod +x "$REPO_DIR/bin/tmux-layout"
-ln -sfn "$REPO_DIR/bin/tmux-layout" "$BIN/tmux-layout"
-echo "已链接: $BIN/tmux-layout → $REPO_DIR/bin/tmux-layout"
+# 3) 脚本（bin/ 下全部链接到 ~/.local/bin）
+for f in "$REPO_DIR"/bin/*; do
+  [ -f "$f" ] || continue
+  n=$(basename "$f")
+  chmod +x "$f"
+  ln -sfn "$f" "$BIN/$n"
+  echo "已链接: $BIN/$n → $f"
+done
 
 # 4) 本机私有配置模板
 if [ ! -f "$REPO_DIR/.config/tmux/90-local.conf" ]; then
@@ -52,4 +56,5 @@ echo "安装完成。验证:"
 echo "  tmux kill-server; tmux new -s main     # 重新加载配置"
 echo "  tmux info | grep -i sixel              # 应显示 Sxl: (bool) true"
 echo "  tmux-layout list                       # 布局模板列表"
+echo "  tmux-sixel-check                       # sixel 可用性自检（在 tmux 里跑）"
 echo "  prefix + S 保存布局 / prefix + L 载入布局"

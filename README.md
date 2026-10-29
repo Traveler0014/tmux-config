@@ -133,6 +133,19 @@ tmux-sixel-check          # 在 tmux 里跑
 
 换到不支持 sixel 的终端时，把两行 `sixel` 注释掉即可，其它 feature 与图形无关。
 
+## 与 WezTerm 的交互（踩坑记录）
+
+- **不要打开 WezTerm 的 `enable_kitty_keyboard`**（截至 nightly `20261010`）。
+  nvim 0.12（`ESC[>3u`）和 pi（`ESC[>7u`）都会请求 kitty 键盘协议，一旦 WezTerm 生效，
+  Windows 输入法**单字符**提交会被 `encode_kitty()` 的 catch-all 分支吞成空串
+  （`KeyCode::Composed` + `raw == None`）→ 表现为"选中候选字后毫无反应"。
+  多字符提交、粘贴、shell 内输入都正常，是典型的不对称症状。
+  上游：[wezterm#8275](https://github.com/wezterm/wezterm/issues/8275)（open），
+  修复 PR [#7915](https://github.com/wezterm/wezterm/pull/7915) / [#7944](https://github.com/wezterm/wezterm/pull/7944)。
+  关掉它不影响 `modifyOtherKeys (CSI > 4; N m)`，应用照样能区分 `C-i` / `C-m`。
+- 本仓库的 `set -g extended-keys on` + `extended-keys-format csi-u` 保留无妨：
+  外层终端不支持 kitty 协议时 tmux 会自动退化，不会出错。
+
 ## 依赖
 
 | 类别 | 需要 | 缺失时 |
