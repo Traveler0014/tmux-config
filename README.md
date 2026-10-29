@@ -146,6 +146,15 @@ tmux-sixel-check          # 在 tmux 里跑
 - 本仓库的 `set -g extended-keys on` + `extended-keys-format csi-u` 保留无妨：
   外层终端不支持 kitty 协议时 tmux 会自动退化，不会出错。
 
+- **日志不要写进 `~/.config/wezterm/`**：WezTerm 监听配置目录，往里写日志会形成
+  「写文件 → 重载配置 → 再写」死循环（实测每秒 8 次重载，鼠标事件会被吞掉）。
+- **应用抢走鼠标时点链接要用 `Shift+左键`**：pi / nvim 这类程序会发
+  `?1000h ?1002h ?1003h ?1006h` 开启鼠标上报，WezTerm 会把点击转发给它们，
+  自己的链接绑定收不到。WezTerm 的绕过键由 `bypass_mouse_reporting_modifiers`
+  控制（默认 `SHIFT`），且绕过时会把 SHIFT 从修饰键里 `remove` 掉——
+  所以 `Ctrl+Shift+左键` 到绑定层只剩 `CTRL`，需要单独给 `mods='CTRL'`
+  绑 `OpenLinkAtMouseCursor` 才生效。
+
 ## 依赖
 
 | 类别 | 需要 | 缺失时 |
