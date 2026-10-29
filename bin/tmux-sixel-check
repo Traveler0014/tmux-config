@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# ============================================================
+# tmux-sixel-check —— 检查「tmux 里的 sixel 图形协议」是否真的通了
+#
+# 用法：在 tmux 里（在 WezTerm 窗口内）执行
+#   tmux-sixel-check
+#
+# 判定标准：
+#   1) 打印出的 client_termfeatures 里含 sixel
+#   2) 下方出现一个彩色方块测试图（红/绿/蓝竖条 + 白横条）
+#      - 图片出现 = 端到端通了
+#      - 只出现乱码/空白 = 外层终端或 tmux 中间有一环没开
+# 注意：必须在「客户端」里跑（$TMUX 非空），否则拿不到终端能力。
+# ============================================================
+set -uo pipefail
+
+pass=0; fail=0
+ok()  { printf '  \033[32m✔\033[0m %s\n' "$*"; pass=$((pass+1)); }
+bad() { printf '  \033[31m✘\033[0m %s\n' "$*"; fail=$((fail+1)); }
+say() { printf '  %s\n' "$*"; }
+
+# ---------------------------------------------------------------- 环境
+printf '== 基础环境 ==\n'
+say "tmux 版本      : $(tmux -V 2>/dev/null || echo '?')"
+say "外层 TERM      : ${TERM:-<空>}"
+say "在其内(tmux)   : ${TMUX:+是}${TMUX:-否}"
+
+if [ -z "${TMUX:-}" ]; then
+  bad "不在 tmux 客户端里（\$TMUX 为空）：无法读取终端能力"
+  say "请在 WezTerm 窗口里 attach 到 tmux 之后再运行本检查"
+else
+  client_term=$(tmux display -p '#{client_termname}' 2>/dev/null)
+  client_feat=$(tmux display -p '#{client_termfeatures}' 2>/dev/null)
+  say "client TERM    : ${client_term:-?}"
+  say "client features: ${client_feat:-?}"
+  case ",${client_feat}," in
+    *,sixel,*) ok "client features 含 sixel（终端能力这一环 OK）" ;;
+    *) bad "client features 不含 sixel（检查 30-sixel.conf 是否被 source）" ;;
+  esac
+
+  # 决定性的一环：tmux 必须知道「一个字符格是多少像素」才能把 sixel 缩放贴上去，
+  # 否则无条件退化成 "SIXEL IMAGE (WxH)" 占位文本。
+  cellw=$(tmux display -p '#{client_cell_width}' 2>/dev/null)
+  cellh=$(tmux display -p '#{client_cell_height}' 2>/dev/null)
+  say "cell 像素尺寸  : ${cellw:-?}x${cellh:-?}"
+  if [ "${cellw:-0}" = "0" ] || [ "${cellh:-0}" = "0" ]; then
+    bad "tmux 不知道单元格像素尺寸 → 必定显示占位文本，无法出图"
+    say "原因：外层 pty 的 ws_xpixel 为 0（WSL/ConPTY 常见），"
+    say "      而 tmux < 3.6 只看 ioctl、不会主动向终端查询像素尺寸。"
+    say "修复：把 tmux 升到 >= 3.6（会发 CSI 18t/14t 问终端）。"
+    say "      kali-rolling 已提供 3.7c： sudo apt install tmux"
+    say "      （3.6 起该问题才修，配置侧无解）"
+  else
+    ok "cell 像素尺寸已知（${cellw}x${cellh}），具备出图条件"
+  fi
+fi
+
+# ---------------------------------------------------------------- 服务端配置
+printf '== 服务端配置 ==\n'
+chk() {
+  local got; got=$(tmux show -gv "$1" 2>/dev/null)
+  if [ "$got" = "$2" ]; then ok "$1 = $got"; else bad "$1 = ${got:-<空>}（期望 $2）"; fi
+}
+if tmux has-session 2>/dev/null; then
+  chk allow-passthrough on
+  chk default-terminal tmux-256color
+  if tmux show -gv terminal-features 2>/dev/null | grep -qi sixel; then
+    ok "terminal-features 里有 sixel 条目"
+  else
+    bad "terminal-features 里没有 sixel 条目"
+  fi
+else
+  bad "没有 tmux 服务器在跑（先 tmux new -s main）"
+fi
+
+# ---------------------------------------------------------------- 出图
+printf '== 图形测试 ==\n'
+say "下面应出现 48x32 的彩色测试图（红/绿/蓝竖条 + 白横条）："
+say "（如果只看到一串乱码字符或什么都没有，说明没通）"
+printf '\n'
+
+if command -v python3 >/dev/null 2>&1; then
+  python3 - <<'PY'
+import sys
+
+W, H = 48, 32
+
+def px(x, y):
+    """返回调色板索引：1=红 2=绿 3=蓝 4=白"""
+    if y >= H - 6:
+        return 4
+    return 1 + (x * 3) // W
+
+palette = {1: (100, 0, 0), 2: (0, 100, 0), 3: (0, 0, 100), 4: (100, 100, 100)}
+
+out = ['\033P0;0;0q', f'"1;1;{W};{H}']
+for idx in sorted(palette):
+    r, g, b = palette[idx]
+    out.append(f'#{idx};2;{r};{g};{b}')
+
+for band in range((H + 5) // 6):
+    y0 = band * 6
+    rows = range(y0, min(H, y0 + 6))
+    used = sorted({px(x, y) for y in rows for x in range(W)})
+    for idx in used:
+        out.append(f'#{idx}')
+        for x in range(W):
+            v = 0
+            for i, y in enumerate(rows):
+                if px(x, y) == idx:
+                    v |= 1 << i
+            out.append(chr(63 + v))
+        out.append('$')
+    out.append('-')
+
+out.append('\033\\')
+sys.stdout.write('  ' + ''.join(out) + '\n\n')
+PY
+  printf '  %s\n' "（若图片正常显示，可忽略上面的 48x32 说明——尺寸只是提示）"
+else
+  bad "没有 python3，无法生成测试图"
+fi
+
+printf '\n== 结论 ==\n'
+if [ "$fail" -eq 0 ]; then
+  printf '  配置侧全部就绪（%d 项通过）。若上方图片也显示了，sixel 端到端可用。\n' "$pass"
+  exit 0
+else
+  printf '  %d 项通过 / %d 项失败。失败项见上。\n' "$pass" "$fail"
+  printf '  排查顺序：\n'
+  printf '    1) cell 像素尺寸是否为 0（最常见：tmux < 3.6 + WSL/ConPTY）\n'
+  printf '    2) WezTerm 是否重启过（config.term 只在重启后生效）\n'
+  printf '    3) tmux kill-server && tmux new -s main（配置改动需重建 server）\n'
+  printf '    4) ~/.config/tmux/30-sixel.conf 是否被 source（tmux show -gv terminal-features）\n'
+  exit 1
+fi

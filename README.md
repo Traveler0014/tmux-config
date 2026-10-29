@@ -7,7 +7,7 @@
 - **模块化加载**：`~/.config/tmux/` 下按序 source（`00-options` → `30-sixel` → `40-layouts` → `90-local`），文件缺失自动跳过
 - **零依赖**：不用 tpm，不引第三方插件；布局脚本是纯 bash
 - **布局模板化**：`prefix+S` 把当前 session 的「窗口划分 + 每个 pane 的目录」存成纯文本模板，`prefix+L` 一条命令还魂；模板可入库跨机器复用
-- **图形协议**：tmux ≥ 3.4 的 sixel 透传配置（外层终端需支持 sixel，如 WezTerm）
+- **图形协议**：sixel 配置 + `tmux-sixel-check` 自检脚本（含 WSL/ConPTY 下 `client_cell_width=0` 的诊断）
 - **机器隔离**：机器相关项写 `90-local.conf`（gitignore，install.sh 从 `.example` 生成）
 - **键位保守**：除 `prefix+S` / `prefix+L` 两个新增键，其余保持 tmux 默认习惯
 
@@ -17,10 +17,11 @@
 tmux-config/
 ├── install.sh                     # 一键安装（symlink 到标准位置）
 ├── bin/tmux-layout                # 布局保存/恢复脚本（零依赖）
+├── bin/tmux-sixel-check           # sixel 可用性自检（含出图测试）
 ├── .config/tmux/
 │   ├── tmux.conf                  # 薄入口：只控制加载顺序
 │   ├── 00-options.conf            # 终端能力 / 历史 / 焦点 / 扩展键 / 鼠标
-│   ├── 30-sixel.conf              # 图形协议（sixel 透传）+ terminal-features
+│   ├── 30-sixel.conf              # 图形协议（sixel）+ terminal-features
 │   ├── 40-layouts.conf            # prefix+S / prefix+L 键位
 │   ├── 90-local.conf.example      # 本机私有配置模板
 │   └── 90-local.conf              # 本机私有（不入库）
@@ -89,24 +90,46 @@ pane|0|1|0|79|1x11|0|zsh|/home/novart/logs
 
 ## 图形协议（sixel）
 
-`30-sixel.conf` 里做的事：
+tmux 3.5 起是**自己解析 + 自己绘制**（不是简单透传）：它先对 pane 里的应用「假装」支持 sixel（DA1 回属性 4），应用于是真的吐 sixel；tmux 解析后按外层终端的单元格像素尺寸缩放重编码再输出。任一条件不满足就退化成 `SIXEL IMAGE (WxH)` + 一串 `+` 的文字占位符。
+
+`30-sixel.conf` 做的事：
 
 ```tmux
 set -as terminal-features ',xterm*:RGB:clipboard:hyperlinks:focus:sync:extkeys'
-set -as terminal-features ',xterm*:sixel'
 set -as terminal-features ',wezterm*:sixel'
 set -g allow-passthrough on
 ```
 
-前提与限制（都是 tmux 侧固有，不是配置问题）：
+### 本机（WSL2 + WezTerm）实测结论
+
+| 环节 | 状态 |
+|---|---|
+| WezTerm 是否支持 sixel | ✅ DA1 = `ESC[?65;4;6;18;22;52c`，属性 4 在 |
+| tmux 是否知道终端支持 sixel | ✅ `terminal-features` + `#{client_termfeatures}` 含 sixel |
+| tmux 是否知道**单元格像素尺寸** | ❌ WSL/ConPTY 的 pty 报 `ws_xpixel=0`；tmux 3.5a 只读 ioctl、不会主动问终端 |
+| 结果 | tmux 3.5a：必然显示 `SIXEL IMAGE (3x2)` 占位文本 |
+| 修法 | 升级 tmux 到 **≥ 3.6**（会发 `CSI 18t` / `CSI 14t` 询问像素尺寸，WezTerm 正常应答 `ESC[8;43;190t` / `ESC[4;946;1900t`） |
+
+验证实验（同一份 tmux 3.5a 二进制，只改 pty 上报的像素尺寸）：
+
+```
+pty 报 ws_xpixel=0     → 输出 "SIXEL IMAGE (3x2)" 占位文本
+pty 报 ws_xpixel=1200  → 输出真实 sixel：ESC P q "1;1;50;36 #0;0;0;0;0 ...
+```
+
+所以**配置侧无解**，只能升级 tmux。自检脚本会直接告诉你 `client_cell_width` 是不是 0：
+
+```sh
+tmux-sixel-check          # 在 tmux 里跑
+```
+
+### 其它限制（tmux 侧固有）
 
 | 项 | 说明 |
 |---|---|
-| 外层终端 | 必须自己支持 sixel（WezTerm / foot / mlterm / 打过补丁的 xterm；kitty 需 sixel 兼容模式） |
-| 应用侧 | 要**直接**输出 sixel；有些工具（chafa/timg/viu/yazi）检测到 `$TMUX` 会主动降级，需显式指定 sixel 输出 |
-| 单图上限 | tmux 3.5 有 1MB 上限（[tmux#4161](https://github.com/tmux/tmux/issues/4161)），大图会被静默丢弃 |
-| 重绘 | 滚动 / 切 pane / 重绘后图像可能残留或错位，属 tmux 侧已知行为 |
-| kitty 图形协议 | tmux 不支持（只支持 sixel 透传）；本机 WezTerm 同时支持 sixel 与 iTerm2 协议，够用 |
+| 单图上限 | 1MB（[tmux#4161](https://github.com/tmux/tmux/issues/4161)），大图被静默丢弃 |
+| 重绘 | 滚动 / 切 pane / 重绘后图像可能残留或错位 |
+| kitty 图形协议 | tmux 不支持（只认 sixel）；WezTerm 两者都支持，但 tmux 只走 sixel |
 
 换到不支持 sixel 的终端时，把两行 `sixel` 注释掉即可，其它 feature 与图形无关。
 
